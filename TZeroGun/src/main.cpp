@@ -13,11 +13,13 @@ constexpr uint16_t kPiPort = 4040;
 constexpr uint16_t kSyncPort = 4041;
 constexpr uint32_t kReconnectIntervalMs = 2000;
 constexpr uint32_t kHeartbeatIntervalMs = 1000;
+constexpr uint32_t kWifiStatusIntervalMs = 2000;
 constexpr uint32_t kAckTimeoutMs = 2000;
 constexpr uint8_t kButtonPin = 4;
 constexpr uint32_t kButtonDebounceMs = 30;
 
 enum class RaceState {
+  kIdle,
   kWaitingForClock,
   kWaitingForAck,
   kArmed,
@@ -29,11 +31,14 @@ WiFiClient piClient;
 WiFiUDP syncUdp;
 uint32_t lastConnectAttemptMs = 0;
 uint32_t lastHeartbeatMs = 0;
+uint32_t lastWifiStatusMs = 0;
 uint32_t ackDeadlineMs = 0;
 uint32_t lastButtonChangeMs = 0;
-RaceState raceState = RaceState::kWaitingForClock;
+RaceState raceState = RaceState::kIdle;
 bool lastButtonReading = HIGH;
 bool buttonState = HIGH;
+bool wifiWasConnected = false;
+bool syncUdpStarted = false;
 int64_t utcOffsetNs = 0;
 uint64_t t0UtcNs = 0;
 uint64_t t0GunMonotonicUs = 0;
@@ -56,6 +61,41 @@ void formatUtc(int64_t timestampNs, char* output, size_t outputSize) {
 void cancelRace(const char* reason) {
   raceState = RaceState::kCancelled;
   Serial.printf("Race cancelled: %s\n", reason);
+}
+
+void updateWifi() {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected && !wifiWasConnected) {
+    wifiWasConnected = true;
+    Serial.printf("Wi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
+
+    if (!syncUdpStarted) {
+      syncUdpStarted = syncUdp.begin(kSyncPort);
+      Serial.printf("Clock sync listening on UDP port %u\n", kSyncPort);
+    }
+    return;
+  }
+
+  if (!connected && wifiWasConnected) {
+    wifiWasConnected = false;
+    piClient.stop();
+    syncUdp.stop();
+    syncUdpStarted = false;
+    Serial.println("Wi-Fi disconnected; retrying in background");
+
+    if (raceState == RaceState::kWaitingForClock ||
+        raceState == RaceState::kWaitingForAck ||
+        raceState == RaceState::kArmed) {
+      cancelRace("Wi-Fi disconnected");
+    }
+  }
+
+  const uint32_t now = millis();
+  if (!connected && now - lastWifiStatusMs >= kWifiStatusIntervalMs) {
+    lastWifiStatusMs = now;
+    Serial.println("Waiting for Wi-Fi...");
+  }
 }
 
 void scheduleT0() {
@@ -144,8 +184,7 @@ void connectToPi() {
   }
 
   piClient.setNoDelay(true);
-  piClient.printf("HELLO TZeroHeroGun %s\n", WiFi.macAddress().c_str());
-  Serial.println("Connected to Pi");
+  Serial.println("Connected to Pi; press the button to begin");
 }
 
 void readPiMessages() {
@@ -205,6 +244,24 @@ void updateButton() {
   buttonState = reading;
   if (buttonState == LOW) {
     Serial.println("Pressed!");
+
+    if (!piClient.connected()) {
+      Serial.println("Cannot start: Pi is not connected");
+      return;
+    }
+
+    if (raceState == RaceState::kWaitingForClock ||
+        raceState == RaceState::kWaitingForAck ||
+        raceState == RaceState::kArmed) {
+      Serial.println("Cannot start: sprint sequence already running");
+      return;
+    }
+
+    t0UtcNs = 0;
+    t0GunMonotonicUs = 0;
+    raceState = RaceState::kWaitingForClock;
+    piClient.printf("HELLO TZeroHeroGun %s\n", WiFi.macAddress().c_str());
+    Serial.println("Gun ready; starting communication with Pi");
   }
 }
 
@@ -270,21 +327,16 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.printf("Connecting to Wi-Fi %s", WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    Serial.print('.');
-  }
-
-  Serial.printf("\nWi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
-  syncUdp.begin(kSyncPort);
-  Serial.printf("Clock sync listening on UDP port %u\n", kSyncPort);
+  Serial.printf("Connecting to Wi-Fi %s in background\n", WIFI_SSID);
 }
 
 void loop() {
+  updateWifi();
   updateButton();
   connectToPi();
-  handleSyncRequests();
+  if (syncUdpStarted) {
+    handleSyncRequests();
+  }
 
   if (piClient.connected()) {
     readPiMessages();
