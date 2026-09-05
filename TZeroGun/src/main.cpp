@@ -12,7 +12,6 @@ namespace {
 constexpr uint16_t kPiPort = 4040;
 constexpr uint16_t kSyncPort = 4041;
 constexpr uint32_t kReconnectIntervalMs = 2000;
-constexpr uint32_t kHeartbeatIntervalMs = 1000;
 constexpr uint32_t kWifiStatusIntervalMs = 2000;
 constexpr uint32_t kAckTimeoutMs = 2000;
 constexpr uint8_t kButtonPin = 4;
@@ -30,7 +29,6 @@ enum class RaceState {
 WiFiClient piClient;
 WiFiUDP syncUdp;
 uint32_t lastConnectAttemptMs = 0;
-uint32_t lastHeartbeatMs = 0;
 uint32_t lastWifiStatusMs = 0;
 uint32_t ackDeadlineMs = 0;
 uint32_t lastButtonChangeMs = 0;
@@ -265,20 +263,6 @@ void updateButton() {
   }
 }
 
-void sendHeartbeat() {
-  if (!piClient.connected()) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  if (now - lastHeartbeatMs < kHeartbeatIntervalMs) {
-    return;
-  }
-  lastHeartbeatMs = now;
-
-  piClient.printf("PING %llu\n",
-                  static_cast<unsigned long long>(esp_timer_get_time()));
-}
 
 void handleSyncRequests() {
   const int packetSize = syncUdp.parsePacket();
@@ -340,7 +324,6 @@ void loop() {
 
   if (piClient.connected()) {
     readPiMessages();
-    sendHeartbeat();
   }
 
   updateRaceState();
