@@ -5,6 +5,7 @@
 #include <esp_system.h>
 #include <time.h>
 
+#include "audio_player.h"
 #include "secrets.h"
 
 namespace {
@@ -16,6 +17,7 @@ constexpr uint32_t kWifiStatusIntervalMs = 2000;
 constexpr uint32_t kAckTimeoutMs = 2000;
 constexpr uint8_t kButtonPin = 4;
 constexpr uint32_t kButtonDebounceMs = 30;
+constexpr bool kAudioTestOnly = true;
 
 enum class RaceState {
   kIdle,
@@ -243,6 +245,15 @@ void updateButton() {
   if (buttonState == LOW) {
     Serial.println("Pressed!");
 
+    if (kAudioTestOnly) {
+      playWav("/onYourMarks.wav");
+      delay(2000);
+      playWav("/getSet.wav");
+      delay(2000);
+      playWav("/gun.wav");
+      return;
+    }
+
     if (!piClient.connected()) {
       Serial.println("Cannot start: Pi is not connected");
       return;
@@ -307,6 +318,15 @@ void setup() {
   buttonState = lastButtonReading;
   Serial.println("Button ready on GPIO4");
 
+  if (kAudioTestOnly) {
+    if (setupAudio()) {
+      Serial.println("Audio test ready; press the button to play gun.wav");
+    } else {
+      Serial.println("Audio setup failed");
+    }
+    return;
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -315,8 +335,14 @@ void setup() {
 }
 
 void loop() {
-  updateWifi();
   updateButton();
+
+  if (kAudioTestOnly) {
+    delay(1);
+    return;
+  }
+
+  updateWifi();
   connectToPi();
   if (syncUdpStarted) {
     handleSyncRequests();
