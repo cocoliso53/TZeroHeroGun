@@ -16,6 +16,8 @@ constexpr uint32_t kReconnectIntervalMs = 2000;
 constexpr uint32_t kWifiStatusIntervalMs = 2000;
 constexpr uint32_t kAckTimeoutMs = 2000;
 constexpr uint8_t kButtonPin = 4;
+constexpr uint8_t kVolumeDownButtonPin = 0;
+constexpr uint8_t kVolumeUpButtonPin = 1;
 constexpr uint32_t kButtonDebounceMs = 30;
 constexpr bool kAudioTestOnly = true;
 constexpr uint64_t kAudioPreparationLeadUs = 25000;
@@ -35,9 +37,15 @@ uint32_t lastConnectAttemptMs = 0;
 uint32_t lastWifiStatusMs = 0;
 uint32_t ackDeadlineMs = 0;
 uint32_t lastButtonChangeMs = 0;
+uint32_t lastVolumeDownChangeMs = 0;
+uint32_t lastVolumeUpChangeMs = 0;
 RaceState raceState = RaceState::kIdle;
 bool lastButtonReading = HIGH;
 bool buttonState = HIGH;
+bool lastVolumeDownReading = HIGH;
+bool volumeDownState = HIGH;
+bool lastVolumeUpReading = HIGH;
+bool volumeUpState = HIGH;
 bool wifiWasConnected = false;
 bool syncUdpStarted = false;
 int64_t utcOffsetNs = 0;
@@ -270,34 +278,70 @@ void playScheduledAudio(const char* label, const char* path,
 
 void runAudioSequence() {
   const uint32_t t0DelaySeconds = randomSeconds(30, 40);
-  const uint32_t setLeadSeconds = randomSeconds(1, 4);
+  const uint32_t setLeadMs = 1500 + (esp_random() % 2501);
   const uint32_t marksLeadSeconds = randomSeconds(15, 20);
-  const uint32_t setDelaySeconds = t0DelaySeconds - setLeadSeconds;
-  const uint32_t marksDelaySeconds = setDelaySeconds - marksLeadSeconds;
   const uint64_t nowUs = esp_timer_get_time();
   const uint64_t t0Us = nowUs + t0DelaySeconds * 1000000ULL;
-  const uint64_t setUs = nowUs + setDelaySeconds * 1000000ULL;
-  const uint64_t marksUs = nowUs + marksDelaySeconds * 1000000ULL;
+  const uint64_t setUs = t0Us - setLeadMs * 1000ULL;
+  const uint64_t marksUs = setUs - marksLeadSeconds * 1000000ULL;
+  const uint64_t setDelayMs = (setUs - nowUs) / 1000ULL;
+  const uint64_t marksDelayMs = (marksUs - nowUs) / 1000ULL;
 
   Serial.println("Schedule selected (microseconds since boot):");
   Serial.printf("  now:           %llu us\n",
                 static_cast<unsigned long long>(nowUs));
-  Serial.printf("  on your marks: %llu us (+%lu s)\n",
+  Serial.printf("  on your marks: %llu us (+%llu ms)\n",
                 static_cast<unsigned long long>(marksUs),
-                static_cast<unsigned long>(marksDelaySeconds));
-  Serial.printf("  set:           %llu us (+%lu s)\n",
+                static_cast<unsigned long long>(marksDelayMs));
+  Serial.printf("  set:           %llu us (+%llu ms)\n",
                 static_cast<unsigned long long>(setUs),
-                static_cast<unsigned long>(setDelaySeconds));
+                static_cast<unsigned long long>(setDelayMs));
   Serial.printf("  t0 / gun:      %llu us (+%lu s)\n",
                 static_cast<unsigned long long>(t0Us),
                 static_cast<unsigned long>(t0DelaySeconds));
-  Serial.printf("  gaps: marks-to-set=%lu s, set-to-t0=%lu s\n",
+  Serial.printf("  gaps: marks-to-set=%lu s, set-to-t0=%lu ms\n",
                 static_cast<unsigned long>(marksLeadSeconds),
-                static_cast<unsigned long>(setLeadSeconds));
+                static_cast<unsigned long>(setLeadMs));
 
   playScheduledAudio("on your marks", "/onYourMarks.wav", marksUs);
   playScheduledAudio("set", "/getSet.wav", setUs);
   playScheduledAudio("t0 / gun", "/gun.wav", t0Us);
+}
+
+bool wasButtonPressed(uint8_t pin, bool& lastReading, bool& stableState,
+                      uint32_t& lastChangeMs) {
+  const bool reading = digitalRead(pin);
+  const uint32_t now = millis();
+
+  if (reading != lastReading) {
+    lastReading = reading;
+    lastChangeMs = now;
+  }
+
+  if (now - lastChangeMs < kButtonDebounceMs || reading == stableState) {
+    return false;
+  }
+
+  stableState = reading;
+  return stableState == LOW;
+}
+
+void previewVolumeChange(int deltaPercent) {
+  const int volumePercent = adjustAudioVolume(deltaPercent);
+  Serial.printf("Volume: %d%%\n", volumePercent);
+  playWav("/gun.wav", esp_timer_get_time() + kAudioPreparationLeadUs);
+}
+
+void updateVolumeButtons() {
+  if (wasButtonPressed(kVolumeUpButtonPin, lastVolumeUpReading,
+                       volumeUpState, lastVolumeUpChangeMs)) {
+    previewVolumeChange(5);
+  }
+
+  if (wasButtonPressed(kVolumeDownButtonPin, lastVolumeDownReading,
+                       volumeDownState, lastVolumeDownChangeMs)) {
+    previewVolumeChange(-5);
+  }
 }
 
 void updateButton() {
@@ -384,11 +428,19 @@ void setup() {
   pinMode(kButtonPin, INPUT_PULLUP);
   lastButtonReading = digitalRead(kButtonPin);
   buttonState = lastButtonReading;
+  pinMode(kVolumeDownButtonPin, INPUT_PULLUP);
+  pinMode(kVolumeUpButtonPin, INPUT_PULLUP);
+  lastVolumeDownReading = digitalRead(kVolumeDownButtonPin);
+  volumeDownState = lastVolumeDownReading;
+  lastVolumeUpReading = digitalRead(kVolumeUpButtonPin);
+  volumeUpState = lastVolumeUpReading;
   Serial.println("Button ready on GPIO4");
 
   if (kAudioTestOnly) {
     if (setupAudio()) {
       Serial.println("Audio sequence ready; press the button to schedule T0");
+      Serial.printf("Volume controls ready: GPIO0 down, GPIO1 up (current: %d%%)\n",
+                    getAudioVolumePercent());
     } else {
       Serial.println("Audio setup failed");
     }
@@ -403,6 +455,9 @@ void setup() {
 }
 
 void loop() {
+  if (kAudioTestOnly) {
+    updateVolumeButtons();
+  }
   updateButton();
 
   if (kAudioTestOnly) {

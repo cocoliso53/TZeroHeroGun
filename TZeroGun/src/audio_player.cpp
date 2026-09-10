@@ -12,7 +12,7 @@ constexpr int kI2SLrcPin = 6;
 constexpr int kI2SDataPin = 7;
 constexpr int kAmplifierShutdownPin = 3;
 constexpr uint32_t kAudioSampleRate = 22050;
-constexpr float kVolume = 0.50f;
+int audioVolumePercent = 50;
 
 bool audioReady = false;
 
@@ -124,6 +124,15 @@ bool setupAudio() {
   return audioReady;
 }
 
+int adjustAudioVolume(int deltaPercent) {
+  audioVolumePercent = constrain(audioVolumePercent + deltaPercent, 0, 100);
+  return audioVolumePercent;
+}
+
+int getAudioVolumePercent() {
+  return audioVolumePercent;
+}
+
 void playSilence(uint32_t durationMs) {
   if (!audioReady) {
     Serial.println("Audio is not ready");
@@ -168,7 +177,7 @@ uint64_t playWav(const char* path, uint64_t targetUs) {
   digitalWrite(kAmplifierShutdownPin, HIGH);
   delay(5);
 
-  Serial.printf("Prepared %s at %.0f%% volume\n", path, kVolume * 100.0f);
+  Serial.printf("Prepared %s at %d%% volume\n", path, audioVolumePercent);
   int16_t mono[256];
   int16_t stereo[512];
   uint64_t firstWriteUs = 0;
@@ -183,7 +192,8 @@ uint64_t playWav(const char* path, uint64_t targetUs) {
 
     const size_t samples = bytesRead / sizeof(int16_t);
     for (size_t index = 0; index < samples; ++index) {
-      const int16_t scaled = static_cast<int16_t>(mono[index] * kVolume);
+      const int16_t scaled = static_cast<int16_t>(
+          (static_cast<int32_t>(mono[index]) * audioVolumePercent) / 100);
       stereo[index * 2] = scaled;
       stereo[index * 2 + 1] = scaled;
     }
