@@ -3,4 +3,4 @@
 
 bool setupAudio();
 void playSilence(uint32_t durationMs);
-void playWav(const char* path);
+uint64_t playWav(const char* path, uint64_t targetUs);

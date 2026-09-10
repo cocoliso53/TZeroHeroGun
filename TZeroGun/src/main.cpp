@@ -18,6 +18,7 @@ constexpr uint32_t kAckTimeoutMs = 2000;
 constexpr uint8_t kButtonPin = 4;
 constexpr uint32_t kButtonDebounceMs = 30;
 constexpr bool kAudioTestOnly = true;
+constexpr uint64_t kAudioPreparationLeadUs = 25000;
 
 enum class RaceState {
   kIdle,
@@ -228,6 +229,77 @@ void updateRaceState() {
   raceState = RaceState::kFired;
 }
 
+uint32_t randomSeconds(uint32_t minimum, uint32_t maximum) {
+  return minimum + (esp_random() % (maximum - minimum + 1));
+}
+
+void waitUntil(uint64_t targetUs) {
+  while (true) {
+    const uint64_t nowUs = esp_timer_get_time();
+    if (nowUs >= targetUs) {
+      return;
+    }
+
+    const uint64_t remainingUs = targetUs - nowUs;
+    if (remainingUs > 2000) {
+      delay((remainingUs - 1000) / 1000);
+    } else {
+      delayMicroseconds(remainingUs);
+    }
+  }
+}
+
+void playScheduledAudio(const char* label, const char* path,
+                        uint64_t targetUs) {
+  const uint64_t preparationUs = targetUs > kAudioPreparationLeadUs
+                                     ? targetUs - kAudioPreparationLeadUs
+                                     : 0;
+  waitUntil(preparationUs);
+  Serial.printf("Preparing audio: %s target=%llu us\n", label,
+                static_cast<unsigned long long>(targetUs));
+
+  const uint64_t playbackStartUs = playWav(path, targetUs);
+  if (playbackStartUs != 0) {
+    Serial.printf("Audio first write: %s scheduled=%llu us actual=%llu us error=%lld us\n",
+                  label,
+                  static_cast<unsigned long long>(targetUs),
+                  static_cast<unsigned long long>(playbackStartUs),
+                  static_cast<long long>(playbackStartUs - targetUs));
+  }
+}
+
+void runAudioSequence() {
+  const uint32_t t0DelaySeconds = randomSeconds(30, 40);
+  const uint32_t setLeadSeconds = randomSeconds(1, 4);
+  const uint32_t marksLeadSeconds = randomSeconds(15, 20);
+  const uint32_t setDelaySeconds = t0DelaySeconds - setLeadSeconds;
+  const uint32_t marksDelaySeconds = setDelaySeconds - marksLeadSeconds;
+  const uint64_t nowUs = esp_timer_get_time();
+  const uint64_t t0Us = nowUs + t0DelaySeconds * 1000000ULL;
+  const uint64_t setUs = nowUs + setDelaySeconds * 1000000ULL;
+  const uint64_t marksUs = nowUs + marksDelaySeconds * 1000000ULL;
+
+  Serial.println("Schedule selected (microseconds since boot):");
+  Serial.printf("  now:           %llu us\n",
+                static_cast<unsigned long long>(nowUs));
+  Serial.printf("  on your marks: %llu us (+%lu s)\n",
+                static_cast<unsigned long long>(marksUs),
+                static_cast<unsigned long>(marksDelaySeconds));
+  Serial.printf("  set:           %llu us (+%lu s)\n",
+                static_cast<unsigned long long>(setUs),
+                static_cast<unsigned long>(setDelaySeconds));
+  Serial.printf("  t0 / gun:      %llu us (+%lu s)\n",
+                static_cast<unsigned long long>(t0Us),
+                static_cast<unsigned long>(t0DelaySeconds));
+  Serial.printf("  gaps: marks-to-set=%lu s, set-to-t0=%lu s\n",
+                static_cast<unsigned long>(marksLeadSeconds),
+                static_cast<unsigned long>(setLeadSeconds));
+
+  playScheduledAudio("on your marks", "/onYourMarks.wav", marksUs);
+  playScheduledAudio("set", "/getSet.wav", setUs);
+  playScheduledAudio("t0 / gun", "/gun.wav", t0Us);
+}
+
 void updateButton() {
   const bool reading = digitalRead(kButtonPin);
   const uint32_t now = millis();
@@ -246,11 +318,7 @@ void updateButton() {
     Serial.println("Pressed!");
 
     if (kAudioTestOnly) {
-      playWav("/onYourMarks.wav");
-      delay(2000);
-      playWav("/getSet.wav");
-      delay(2000);
-      playWav("/gun.wav");
+      runAudioSequence();
       return;
     }
 
@@ -320,7 +388,7 @@ void setup() {
 
   if (kAudioTestOnly) {
     if (setupAudio()) {
-      Serial.println("Audio test ready; press the button to play gun.wav");
+      Serial.println("Audio sequence ready; press the button to schedule T0");
     } else {
       Serial.println("Audio setup failed");
     }

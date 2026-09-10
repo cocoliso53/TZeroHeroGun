@@ -71,6 +71,22 @@ bool findWavData(File& file, uint32_t& dataSize) {
   return false;
 }
 
+void waitUntilAudioStart(uint64_t targetUs) {
+  while (true) {
+    const uint64_t nowUs = esp_timer_get_time();
+    if (nowUs >= targetUs) {
+      return;
+    }
+
+    const uint64_t remainingUs = targetUs - nowUs;
+    if (remainingUs > 2000) {
+      delay((remainingUs - 1000) / 1000);
+    } else {
+      delayMicroseconds(remainingUs);
+    }
+  }
+}
+
 }  // namespace
 
 bool setupAudio() {
@@ -135,26 +151,27 @@ void playSilence(uint32_t durationMs) {
   Serial.println("Silence test complete");
 }
 
-void playWav(const char* path) {
+uint64_t playWav(const char* path, uint64_t targetUs) {
   if (!audioReady) {
     Serial.println("Audio is not ready");
-    return;
+    return 0;
   }
 
   File file = LittleFS.open(path, "r");
   uint32_t remaining = 0;
   if (!file || !findWavData(file, remaining)) {
     Serial.printf("Cannot play %s: invalid or missing WAV\n", path);
-    return;
+    return 0;
   }
 
   i2s_zero_dma_buffer(kI2SPort);
   digitalWrite(kAmplifierShutdownPin, HIGH);
   delay(5);
 
-  Serial.printf("Playing %s at %.0f%% volume\n", path, kVolume * 100.0f);
+  Serial.printf("Prepared %s at %.0f%% volume\n", path, kVolume * 100.0f);
   int16_t mono[256];
   int16_t stereo[512];
+  uint64_t firstWriteUs = 0;
 
   while (remaining > 0) {
     const size_t wanted = min(static_cast<size_t>(remaining), sizeof(mono));
@@ -172,6 +189,10 @@ void playWav(const char* path) {
     }
 
     size_t bytesWritten = 0;
+    if (firstWriteUs == 0) {
+      waitUntilAudioStart(targetUs);
+      firstWriteUs = esp_timer_get_time();
+    }
     i2s_write(kI2SPort, stereo, samples * 2 * sizeof(int16_t),
               &bytesWritten, portMAX_DELAY);
     remaining -= bytesRead;
@@ -183,4 +204,5 @@ void playWav(const char* path) {
   digitalWrite(kAmplifierShutdownPin, LOW);
   file.close();
   Serial.println("Playback complete");
+  return firstWriteUs;
 }
