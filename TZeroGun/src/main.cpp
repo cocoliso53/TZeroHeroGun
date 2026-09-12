@@ -19,15 +19,15 @@ constexpr uint8_t kButtonPin = 4;
 constexpr uint8_t kVolumeDownButtonPin = 0;
 constexpr uint8_t kVolumeUpButtonPin = 1;
 constexpr uint32_t kButtonDebounceMs = 30;
-constexpr bool kAudioTestOnly = true;
+constexpr bool kAudioTestOnly = false;
 constexpr uint64_t kAudioPreparationLeadUs = 25000;
 
 enum class RaceState {
   kIdle,
   kWaitingForClock,
+  kReady,
   kWaitingForAck,
   kArmed,
-  kFired,
   kCancelled,
 };
 
@@ -51,6 +51,9 @@ bool syncUdpStarted = false;
 int64_t utcOffsetNs = 0;
 uint64_t t0UtcNs = 0;
 uint64_t t0GunMonotonicUs = 0;
+uint64_t setGunMonotonicUs = 0;
+uint64_t marksGunMonotonicUs = 0;
+uint8_t nextAudioEvent = 0;
 
 int64_t adjustedUtcNowNs() {
   return esp_timer_get_time() * 1000LL + utcOffsetNs;
@@ -70,6 +73,16 @@ void formatUtc(int64_t timestampNs, char* output, size_t outputSize) {
 void cancelRace(const char* reason) {
   raceState = RaceState::kCancelled;
   Serial.printf("Race cancelled: %s\n", reason);
+}
+
+void returnToReady(const char* reason) {
+  raceState = RaceState::kReady;
+  t0UtcNs = 0;
+  t0GunMonotonicUs = 0;
+  setGunMonotonicUs = 0;
+  marksGunMonotonicUs = 0;
+  nextAudioEvent = 0;
+  Serial.printf("%s; ready for another T0\n", reason);
 }
 
 void updateWifi() {
@@ -108,14 +121,24 @@ void updateWifi() {
 }
 
 void scheduleT0() {
-  const uint64_t randomDelayUs = 7000000ULL + (esp_random() % 5000001ULL);
+  const uint32_t t0DelaySeconds = 30 + (esp_random() % 11);
+  const uint32_t setLeadMs = 1500 + (esp_random() % 2501);
+  const uint32_t marksLeadSeconds = 15 + (esp_random() % 6);
+  const uint64_t randomDelayUs = t0DelaySeconds * 1000000ULL;
   t0UtcNs = adjustedUtcNowNs() + randomDelayUs * 1000ULL;
   t0GunMonotonicUs = (t0UtcNs - utcOffsetNs + 999) / 1000;
+  setGunMonotonicUs = t0GunMonotonicUs - setLeadMs * 1000ULL;
+  marksGunMonotonicUs =
+      setGunMonotonicUs - marksLeadSeconds * 1000000ULL;
+  nextAudioEvent = 0;
 
   char formattedT0[48];
   formatUtc(t0UtcNs, formattedT0, sizeof(formattedT0));
   Serial.printf("T0 selected: %s (%llu ns)\n", formattedT0,
                 static_cast<unsigned long long>(t0UtcNs));
+  Serial.printf("Audio gaps: marks-to-set=%lu s, set-to-t0=%lu ms\n",
+                static_cast<unsigned long>(marksLeadSeconds),
+                static_cast<unsigned long>(setLeadMs));
 
   piClient.printf("T0 %llu\n", static_cast<unsigned long long>(t0UtcNs));
   ackDeadlineMs = millis() + kAckTimeoutMs;
@@ -124,13 +147,6 @@ void scheduleT0() {
 
 void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
   Serial.printf("Pi: %s\n", message);
-
-  if (strcmp(message, "PI_READY") == 0 &&
-      raceState == RaceState::kWaitingForClock) {
-    piClient.println("GUN_READY");
-    Serial.println("Gun ready; waiting for clock synchronization");
-    return;
-  }
 
   if (strncmp(message, "CLOCK_SYNC ", 11) == 0 &&
       raceState == RaceState::kWaitingForClock) {
@@ -144,7 +160,9 @@ void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
     utcOffsetNs = static_cast<int64_t>(estimatedUtcNs) - receivedMonotonicNs;
     Serial.printf("Clock calibrated: one_way_us=%llu utc_offset_ns=%lld\n",
                   oneWayUs, static_cast<long long>(utcOffsetNs));
-    scheduleT0();
+    raceState = RaceState::kReady;
+    piClient.println("CLOCK_SYNCED");
+    Serial.println("Clock synchronized; press the button to set T0");
     return;
   }
 
@@ -164,6 +182,12 @@ void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
 
     raceState = RaceState::kArmed;
     Serial.println("T0 acknowledged; gun armed");
+    return;
+  }
+
+  if (strncmp(message, "REJECT_T0 ", 10) == 0 &&
+      raceState == RaceState::kWaitingForAck) {
+    returnToReady(message + 10);
     return;
   }
 
@@ -193,7 +217,9 @@ void connectToPi() {
   }
 
   piClient.setNoDelay(true);
-  Serial.println("Connected to Pi; press the button to begin");
+  raceState = RaceState::kWaitingForClock;
+  piClient.printf("HELLO TZeroHeroGun %s\n", WiFi.macAddress().c_str());
+  Serial.println("Connected to Pi; starting clock synchronization");
 }
 
 void readPiMessages() {
@@ -214,19 +240,43 @@ void readPiMessages() {
   }
 }
 
+uint64_t playScheduledAudio(const char* label, const char* path,
+                            uint64_t targetUs);
+
 void updateRaceState() {
   if (raceState == RaceState::kWaitingForAck &&
       static_cast<int32_t>(millis() - ackDeadlineMs) >= 0) {
-    cancelRace("T0 acknowledgement timeout");
+    returnToReady("T0 acknowledgement timeout");
     return;
   }
 
-  if (raceState != RaceState::kArmed ||
-      esp_timer_get_time() < static_cast<int64_t>(t0GunMonotonicUs)) {
+  if (raceState != RaceState::kArmed) {
     return;
   }
 
-  const int64_t actualUtcNs = adjustedUtcNowNs();
+  const char* labels[] = {"on your marks", "set", "t0 / gun"};
+  const char* paths[] = {"/onYourMarks.wav", "/getSet.wav", "/gun.wav"};
+  const uint64_t targets[] = {
+      marksGunMonotonicUs, setGunMonotonicUs, t0GunMonotonicUs};
+
+  if (nextAudioEvent >= 3 ||
+      esp_timer_get_time() + kAudioPreparationLeadUs < targets[nextAudioEvent]) {
+    return;
+  }
+
+  const uint8_t event = nextAudioEvent++;
+  const uint64_t playbackStartUs =
+      playScheduledAudio(labels[event], paths[event], targets[event]);
+  if (playbackStartUs == 0) {
+    cancelRace("audio playback failed");
+    return;
+  }
+  if (event != 2) {
+    return;
+  }
+
+  const int64_t actualUtcNs =
+      static_cast<int64_t>(playbackStartUs) * 1000LL + utcOffsetNs;
   const int64_t errorUs = (actualUtcNs - static_cast<int64_t>(t0UtcNs)) / 1000;
   char actualUtc[48];
   formatUtc(actualUtcNs, actualUtc, sizeof(actualUtc));
@@ -234,7 +284,7 @@ void updateRaceState() {
   Serial.printf("GUN!! utc=%s (%lld ns) error_us=%lld\n", actualUtc,
                 static_cast<long long>(actualUtcNs),
                 static_cast<long long>(errorUs));
-  raceState = RaceState::kFired;
+  returnToReady("Race fired");
 }
 
 uint32_t randomSeconds(uint32_t minimum, uint32_t maximum) {
@@ -257,8 +307,8 @@ void waitUntil(uint64_t targetUs) {
   }
 }
 
-void playScheduledAudio(const char* label, const char* path,
-                        uint64_t targetUs) {
+uint64_t playScheduledAudio(const char* label, const char* path,
+                            uint64_t targetUs) {
   const uint64_t preparationUs = targetUs > kAudioPreparationLeadUs
                                      ? targetUs - kAudioPreparationLeadUs
                                      : 0;
@@ -274,6 +324,7 @@ void playScheduledAudio(const char* label, const char* path,
                   static_cast<unsigned long long>(playbackStartUs),
                   static_cast<long long>(playbackStartUs - targetUs));
   }
+  return playbackStartUs;
 }
 
 void runAudioSequence() {
@@ -371,18 +422,17 @@ void updateButton() {
       return;
     }
 
-    if (raceState == RaceState::kWaitingForClock ||
-        raceState == RaceState::kWaitingForAck ||
-        raceState == RaceState::kArmed) {
-      Serial.println("Cannot start: sprint sequence already running");
+    if (raceState != RaceState::kReady) {
+      Serial.println("Cannot set T0: gun is not synchronized and ready");
       return;
     }
 
     t0UtcNs = 0;
     t0GunMonotonicUs = 0;
-    raceState = RaceState::kWaitingForClock;
-    piClient.printf("HELLO TZeroHeroGun %s\n", WiFi.macAddress().c_str());
-    Serial.println("Gun ready; starting communication with Pi");
+    setGunMonotonicUs = 0;
+    marksGunMonotonicUs = 0;
+    nextAudioEvent = 0;
+    scheduleT0();
   }
 }
 
@@ -436,14 +486,16 @@ void setup() {
   volumeUpState = lastVolumeUpReading;
   Serial.println("Button ready on GPIO4");
 
+  if (setupAudio()) {
+    Serial.println("Audio ready");
+    Serial.printf("Volume controls ready: GPIO0 down, GPIO1 up (current: %d%%)\n",
+                  getAudioVolumePercent());
+  } else {
+    Serial.println("Audio setup failed");
+  }
+
   if (kAudioTestOnly) {
-    if (setupAudio()) {
-      Serial.println("Audio sequence ready; press the button to schedule T0");
-      Serial.printf("Volume controls ready: GPIO0 down, GPIO1 up (current: %d%%)\n",
-                    getAudioVolumePercent());
-    } else {
-      Serial.println("Audio setup failed");
-    }
+    Serial.println("Audio sequence ready; press the button to schedule T0");
     return;
   }
 
@@ -455,9 +507,7 @@ void setup() {
 }
 
 void loop() {
-  if (kAudioTestOnly) {
-    updateVolumeButtons();
-  }
+  updateVolumeButtons();
   updateButton();
 
   if (kAudioTestOnly) {
