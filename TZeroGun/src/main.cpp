@@ -40,8 +40,7 @@ uint32_t lastButtonChangeMs = 0;
 uint32_t lastVolumeDownChangeMs = 0;
 uint32_t lastVolumeUpChangeMs = 0;
 RaceState raceState = RaceState::kIdle;
-bool lastButtonReading = HIGH;
-bool buttonState = HIGH;
+volatile bool mainButtonPressPending = false;
 bool lastVolumeDownReading = HIGH;
 bool volumeDownState = HIGH;
 bool lastVolumeUpReading = HIGH;
@@ -54,6 +53,10 @@ uint64_t t0GunMonotonicUs = 0;
 uint64_t setGunMonotonicUs = 0;
 uint64_t marksGunMonotonicUs = 0;
 uint8_t nextAudioEvent = 0;
+
+void IRAM_ATTR captureMainButtonPress() {
+  mainButtonPressPending = true;
+}
 
 int64_t adjustedUtcNowNs() {
   return esp_timer_get_time() * 1000LL + utcOffsetNs;
@@ -145,6 +148,18 @@ void scheduleT0() {
   raceState = RaceState::kWaitingForAck;
 }
 
+void beginNewT0(bool replacingT0) {
+  t0UtcNs = 0;
+  t0GunMonotonicUs = 0;
+  setGunMonotonicUs = 0;
+  marksGunMonotonicUs = 0;
+  nextAudioEvent = 0;
+  if (replacingT0) {
+    Serial.println("Replacing the scheduled T0");
+  }
+  scheduleT0();
+}
+
 void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
   Serial.printf("Pi: %s\n", message);
 
@@ -163,6 +178,16 @@ void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
     raceState = RaceState::kReady;
     piClient.println("CLOCK_SYNCED");
     Serial.println("Clock synchronized; press the button to set T0");
+    return;
+  }
+
+  if (strcmp(message, "REQUEST_T0") == 0) {
+    if (raceState != RaceState::kReady) {
+      piClient.println("START_REJECT busy");
+      return;
+    }
+    Serial.println("Pi requested a new T0");
+    beginNewT0(false);
     return;
   }
 
@@ -396,44 +421,41 @@ void updateVolumeButtons() {
 }
 
 void updateButton() {
-  const bool reading = digitalRead(kButtonPin);
-  const uint32_t now = millis();
+  noInterrupts();
+  const bool pressed = mainButtonPressPending;
+  mainButtonPressPending = false;
+  interrupts();
 
-  if (reading != lastButtonReading) {
-    lastButtonChangeMs = now;
-    lastButtonReading = reading;
-  }
-
-  if (now - lastButtonChangeMs < kButtonDebounceMs || reading == buttonState) {
+  if (!pressed) {
     return;
   }
 
-  buttonState = reading;
-  if (buttonState == LOW) {
-    Serial.println("Pressed!");
-
-    if (kAudioTestOnly) {
-      runAudioSequence();
-      return;
-    }
-
-    if (!piClient.connected()) {
-      Serial.println("Cannot start: Pi is not connected");
-      return;
-    }
-
-    if (raceState != RaceState::kReady) {
-      Serial.println("Cannot set T0: gun is not synchronized and ready");
-      return;
-    }
-
-    t0UtcNs = 0;
-    t0GunMonotonicUs = 0;
-    setGunMonotonicUs = 0;
-    marksGunMonotonicUs = 0;
-    nextAudioEvent = 0;
-    scheduleT0();
+  const uint32_t now = millis();
+  if (now - lastButtonChangeMs < kButtonDebounceMs) {
+    return;
   }
+  lastButtonChangeMs = now;
+
+  Serial.println("Pressed!");
+
+  if (kAudioTestOnly) {
+    runAudioSequence();
+    return;
+  }
+
+  if (!piClient.connected()) {
+    Serial.println("Cannot start: Pi is not connected");
+    return;
+  }
+
+  if (raceState != RaceState::kReady && raceState != RaceState::kArmed) {
+    Serial.println("Cannot set T0: gun is not synchronized and ready");
+    return;
+  }
+
+  const bool replacingT0 = raceState == RaceState::kArmed;
+
+  beginNewT0(replacingT0);
 }
 
 
@@ -476,8 +498,8 @@ void setup() {
   delay(500);
 
   pinMode(kButtonPin, INPUT_PULLUP);
-  lastButtonReading = digitalRead(kButtonPin);
-  buttonState = lastButtonReading;
+  attachInterrupt(digitalPinToInterrupt(kButtonPin), captureMainButtonPress,
+                  FALLING);
   pinMode(kVolumeDownButtonPin, INPUT_PULLUP);
   pinMode(kVolumeUpButtonPin, INPUT_PULLUP);
   lastVolumeDownReading = digitalRead(kVolumeDownButtonPin);
