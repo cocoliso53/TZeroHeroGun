@@ -18,7 +18,11 @@ constexpr uint32_t kAckTimeoutMs = 2000;
 constexpr uint8_t kButtonPin = 4;
 constexpr uint8_t kVolumeDownButtonPin = 0;
 constexpr uint8_t kVolumeUpButtonPin = 1;
+constexpr uint8_t kStatusLedPin = 10;
 constexpr uint32_t kButtonDebounceMs = 30;
+constexpr uint32_t kSyncBlinkPeriodMs = 2000;
+constexpr uint32_t kSyncBlinkOnMs = 150;
+constexpr uint32_t kSuccessBlinkMs = 120;
 constexpr bool kAudioTestOnly = false;
 constexpr uint64_t kAudioPreparationLeadUs = 25000;
 
@@ -29,6 +33,12 @@ enum class RaceState {
   kWaitingForAck,
   kArmed,
   kCancelled,
+};
+
+enum class SyncLedMode {
+  kOff,
+  kSyncing,
+  kSuccess,
 };
 
 WiFiClient piClient;
@@ -53,6 +63,54 @@ uint64_t t0GunMonotonicUs = 0;
 uint64_t setGunMonotonicUs = 0;
 uint64_t marksGunMonotonicUs = 0;
 uint8_t nextAudioEvent = 0;
+SyncLedMode syncLedMode = SyncLedMode::kOff;
+bool statusLedOn = false;
+uint8_t successLedTransitionsRemaining = 0;
+uint32_t nextStatusLedChangeMs = 0;
+
+void setStatusLed(bool on) {
+  statusLedOn = on;
+  digitalWrite(kStatusLedPin, on ? HIGH : LOW);
+}
+
+void startSyncLed() {
+  if (syncLedMode == SyncLedMode::kSyncing) {
+    return;
+  }
+  syncLedMode = SyncLedMode::kSyncing;
+  setStatusLed(true);
+  nextStatusLedChangeMs = millis() + kSyncBlinkOnMs;
+}
+
+void showSyncSuccess() {
+  syncLedMode = SyncLedMode::kSuccess;
+  successLedTransitionsRemaining = 5;
+  setStatusLed(true);
+  nextStatusLedChangeMs = millis() + kSuccessBlinkMs;
+}
+
+void updateStatusLed() {
+  if (syncLedMode == SyncLedMode::kOff ||
+      static_cast<int32_t>(millis() - nextStatusLedChangeMs) < 0) {
+    return;
+  }
+
+  if (syncLedMode == SyncLedMode::kSyncing) {
+    setStatusLed(!statusLedOn);
+    nextStatusLedChangeMs =
+        millis() + (statusLedOn ? kSyncBlinkOnMs
+                               : kSyncBlinkPeriodMs - kSyncBlinkOnMs);
+    return;
+  }
+
+  setStatusLed(!statusLedOn);
+  if (--successLedTransitionsRemaining == 0) {
+    syncLedMode = SyncLedMode::kOff;
+    setStatusLed(false);
+    return;
+  }
+  nextStatusLedChangeMs = millis() + kSuccessBlinkMs;
+}
 
 void IRAM_ATTR captureMainButtonPress() {
   mainButtonPressPending = true;
@@ -177,6 +235,7 @@ void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
                   oneWayUs, static_cast<long long>(utcOffsetNs));
     raceState = RaceState::kReady;
     piClient.println("CLOCK_SYNCED");
+    showSyncSuccess();
     Serial.println("Clock synchronized; press the button to set T0");
     return;
   }
@@ -206,6 +265,7 @@ void handlePiMessage(const char* message, int64_t receivedMonotonicNs) {
     }
 
     raceState = RaceState::kArmed;
+    showSyncSuccess();
     Serial.println("T0 acknowledged; gun armed");
     return;
   }
@@ -225,6 +285,8 @@ void connectToPi() {
   if (WiFi.status() != WL_CONNECTED || piClient.connected()) {
     return;
   }
+
+  startSyncLed();
 
   const uint32_t now = millis();
   if (now - lastConnectAttemptMs < kReconnectIntervalMs) {
@@ -497,6 +559,9 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  pinMode(kStatusLedPin, OUTPUT);
+  setStatusLed(false);
+
   pinMode(kButtonPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(kButtonPin), captureMainButtonPress,
                   FALLING);
@@ -521,6 +586,8 @@ void setup() {
     return;
   }
 
+  startSyncLed();
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -529,6 +596,7 @@ void setup() {
 }
 
 void loop() {
+  updateStatusLed();
   updateVolumeButtons();
   updateButton();
 
